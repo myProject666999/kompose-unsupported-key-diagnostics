@@ -21,6 +21,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/kubernetes/kompose/pkg/diagnostic"
 	"github.com/kubernetes/kompose/pkg/kobject"
 	"github.com/kubernetes/kompose/pkg/transformer"
 	"github.com/kubernetes/kompose/pkg/transformer/kubernetes"
@@ -44,11 +45,15 @@ type OpenShift struct {
 	kubernetes.Kubernetes
 }
 
-// list of all unsupported keys for this transformer
-// Keys are names of variables in kobject struct.
-// this is map to make searching for keys easier
-// to make sure that unsupported key is not going to be reported twice
-// by keeping record if already saw this key in another service
+// OpenShift-specific degradation diagnostics. The loader-side registry covers
+// Compose service keys; this map covers keys that are only unsupported for the
+// OpenShift provider. Keys are kobject field names; the diagnostic key name is
+// taken from the LoadedFrom tag, so the message uses the same label name as the
+// Compose loader.
+//
+// It is intentionally empty today: the OpenShift converter supports the same
+// Compose keys as Kubernetes. The plumbing is kept so provider-specific limits
+// can be declared here and flow through the shared diagnostic type.
 var unsupportedKey = map[string]bool{}
 
 // initImageStream initializes ImageStream object
@@ -253,9 +258,16 @@ func (o *OpenShift) initRoute(name string, service kobject.ServiceConfig, port i
 // Transform maps komposeObject to openshift objects
 // returns objects that are already sorted in the way that Services are first
 func (o *OpenShift) Transform(komposeObject kobject.KomposeObject, opt kobject.ConvertOptions) ([]runtime.Object, error) {
+	// Report provider-specific unsupported keys through the shared diagnostic
+	// report so OpenShift and Kubernetes share one type and one log format.
+	o.Kubernetes.Report = komposeObject.Diagnostics
 	noSupKeys := o.Kubernetes.CheckUnsupportedKey(&komposeObject, unsupportedKey)
 	for _, keyName := range noSupKeys {
-		log.Warningf("OpenShift provider doesn't support %s key - ignoring", keyName)
+		komposeObject.Diagnostics.Add(diagnostic.Diagnostic{
+			Category: diagnostic.Ignored,
+			Key:      keyName,
+			Message:  "OpenShift provider doesn't support " + keyName + " key - ignoring",
+		})
 	}
 	// this will hold all the converted data
 	var allobjects []runtime.Object
@@ -329,6 +341,17 @@ func (o *OpenShift) Transform(komposeObject kobject.KomposeObject, opt kobject.C
 		if service.Restart == "no" || service.Restart == "on-failure" {
 			// Error out if Controller Object is specified with restart: 'on-failure'
 			if opt.IsDeploymentConfigFlag {
+				// Valid Compose input that OpenShift cannot express: the user
+				// must choose a controller that supports the restart policy.
+				komposeObject.Diagnostics.Add(diagnostic.Diagnostic{
+					Category: diagnostic.Rejected,
+					Origin:   diagnostic.OriginUnsupported,
+					Service:  service.Name,
+					Key:      "restart",
+					Original: service.Restart,
+					Location: "pkg/transformer/openshift/openshift.go:Transform",
+					Message:  "Controller object cannot be specified with restart: 'on-failure'",
+				})
 				return nil, errors.New("Controller object cannot be specified with restart: 'on-failure'")
 			}
 

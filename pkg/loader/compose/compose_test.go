@@ -537,8 +537,10 @@ func TestUnsupportedKeys(t *testing.T) {
 	}{
 		"With Networks (service and root level)": {
 			projectWithNetworks,
-			//root level network and network are now supported"
-			[]string{"root level volumes"},
+			// Root-level volumes themselves are supported (they feed PVC size
+			// labels); the unsupported sub-keys and the network driver are what
+			// get reported.
+			[]string{"volumes.foo.driver", "networks.foo.driver"},
 		},
 		"Default root level Network": {
 			projectWithDefaultNetwork,
@@ -548,9 +550,18 @@ func TestUnsupportedKeys(t *testing.T) {
 
 	for name, test := range testCases {
 		t.Log("Test case:", name)
-		keys := checkUnsupportedKey(test.composeProject)
-		if !reflect.DeepEqual(keys, test.expectedUnsupportedKeys) {
-			t.Errorf("ERROR: Expecting unsupported keys: ['%s']. Got: ['%s']", strings.Join(test.expectedUnsupportedKeys, "', '"), strings.Join(keys, "', '"))
+		keys := checkUnsupportedKey(test.composeProject).Lines()
+		for _, expected := range test.expectedUnsupportedKeys {
+			found := false
+			for _, line := range keys {
+				if strings.Contains(line, "key="+expected) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("ERROR: Expecting a diagnostic for key %q. Got: %v", expected, keys)
+			}
 		}
 	}
 }

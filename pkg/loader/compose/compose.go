@@ -20,15 +20,14 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/fatih/structs"
 	"github.com/google/shlex"
+	"github.com/kubernetes/kompose/pkg/diagnostic"
 	"github.com/kubernetes/kompose/pkg/kobject"
 	"github.com/kubernetes/kompose/pkg/transformer"
 	"github.com/pkg/errors"
@@ -45,109 +44,13 @@ var StdinData []byte
 type Compose struct {
 }
 
-// checkUnsupportedKey checks if compose-go project contains
-// keys that are not supported by this loader.
-// list of all unsupported keys are stored in unsupportedKey variable
-// returns list of unsupported YAML keys from docker-compose
-func checkUnsupportedKey(composeProject *types.Project) []string {
-	// list of all unsupported keys for this loader
-	// this is map to make searching for keys easier
-	// to make sure that unsupported key is not going to be reported twice
-	// by keeping record if already saw this key in another service
-	var unsupportedKey = map[string]bool{
-		"CgroupParent":  false,
-		"CPUSet":        false,
-		"CPUShares":     false,
-		"Devices":       false,
-		"DependsOn":     false,
-		"DNS":           false,
-		"DNSSearch":     false,
-		"EnvFile":       false,
-		"ExternalLinks": false,
-		"ExtraHosts":    false,
-		"Ipc":           false,
-		"Logging":       false,
-		"MacAddress":    false,
-		"MemSwapLimit":  false,
-		"NetworkMode":   false,
-		"SecurityOpt":   false,
-		"ShmSize":       false,
-		"StopSignal":    false,
-		"VolumeDriver":  false,
-		"Uts":           false,
-		"ReadOnly":      false,
-		"Ulimits":       false,
-		"Net":           false,
-		"Sysctls":       false,
-		//"Networks":    false, // We shall be spporting network now. There are special checks for Network in checkUnsupportedKey function
-		"Links": false,
-	}
-
-	var keysFound []string
-
-	// Root level keys are not yet supported except Network
-	// Check to see if the default network is available and length is only equal to one.
-	if _, ok := composeProject.Networks["default"]; ok && len(composeProject.Networks) == 1 {
-		log.Debug("Default network found")
-	}
-
-	// Root level volumes are not yet supported
-	if len(composeProject.Volumes) > 0 {
-		keysFound = append(keysFound, "root level volumes")
-	}
-
-	for _, serviceConfig := range composeProject.AllServices() {
-		// this reflection is used in check for empty arrays
-		val := reflect.ValueOf(serviceConfig)
-		s := structs.New(serviceConfig)
-
-		for _, f := range s.Fields() {
-			// Check if given key is among unsupported keys, and skip it if we already saw this key
-			if alreadySaw, ok := unsupportedKey[f.Name()]; ok && !alreadySaw {
-				if f.IsExported() && !f.IsZero() {
-					// IsZero returns false for empty array/slice ([])
-					// this check if field is Slice, and then it checks its size
-					if field := val.FieldByName(f.Name()); field.Kind() == reflect.Slice {
-						if field.Len() == 0 {
-							// array is empty it doesn't matter if it is in unsupportedKey or not
-							continue
-						}
-					}
-					//get yaml tag name instead of variable name
-					yamlTagName := strings.Split(f.Tag("yaml"), ",")[0]
-					if f.Name() == "Networks" {
-						// networks always contains one default element, even it isn't declared in compose v2.
-						if len(serviceConfig.Networks) == 1 && serviceConfig.NetworksByPriority()[0] == "default" {
-							// this is empty Network definition, skip it
-							continue
-						}
-					}
-
-					if linksArray := val.FieldByName(f.Name()); f.Name() == "Links" && linksArray.Kind() == reflect.Slice {
-						//Links has "SERVICE:ALIAS" style, we don't support SERVICE != ALIAS
-						findUnsupportedLinksFlag := false
-						for i := 0; i < linksArray.Len(); i++ {
-							if tmpLink := linksArray.Index(i); tmpLink.Kind() == reflect.String {
-								tmpLinkStr := tmpLink.String()
-								tmpLinkStrSplit := strings.Split(tmpLinkStr, ":")
-								if len(tmpLinkStrSplit) == 2 && tmpLinkStrSplit[0] != tmpLinkStrSplit[1] {
-									findUnsupportedLinksFlag = true
-									break
-								}
-							}
-						}
-						if !findUnsupportedLinksFlag {
-							continue
-						}
-					}
-
-					keysFound = append(keysFound, yamlTagName)
-					unsupportedKey[f.Name()] = true
-				}
-			}
-		}
-	}
-	return keysFound
+// checkUnsupportedKey collects the structured degradation diagnostics for a
+// loaded compose project and renders them through the shared diagnostic
+// report. The registry of degrading keys lives in unsupported.go.
+func checkUnsupportedKey(composeProject *types.Project) *diagnostic.Report {
+	report := diagnostic.NewReport()
+	collectUnsupportedKeys(composeProject, report)
+	return report
 }
 
 // LoadFile loads a compose file into KomposeObject
@@ -183,7 +86,7 @@ func (c *Compose) LoadFile(files []string, profiles []string, noInterpolate bool
 		log.Warning("No service selected. The profile specified in services of your compose yaml may not exist.")
 	}
 
-	komposeObject, err := dockerComposeToKomposeMapping(project)
+	komposeObject, err := dockerComposeToKomposeMapping(project, checkUnsupportedKey(project))
 	if err != nil {
 		return kobject.KomposeObject{}, err
 	}
@@ -453,12 +356,13 @@ func parseHealthCheck(composeHealthCheck types.HealthCheckConfig, labels types.L
 	}, nil
 }
 
-func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.KomposeObject, error) {
+func dockerComposeToKomposeMapping(composeObject *types.Project, report *diagnostic.Report) (kobject.KomposeObject, error) {
 	// Step 1. Initialize what's going to be returned
 	komposeObject := kobject.KomposeObject{
 		ServiceConfigs: make(map[string]kobject.ServiceConfig),
 		LoadedFrom:     "compose",
 		Secrets:        composeObject.Secrets,
+		Diagnostics:    report,
 	}
 
 	// Step 2. Parse through the object and convert it to kobject.KomposeObject!
@@ -553,8 +457,10 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 			}
 		}
 
+		// The semantic change from unless-stopped to always is reported through
+		// the structured diagnostic registry (see unsupported.go), so no direct
+		// log line is emitted here.
 		if serviceConfig.Restart == "unless-stopped" {
-			log.Warnf("Restart policy 'unless-stopped' in service %s is not supported, convert it to 'always'", name)
 			serviceConfig.Restart = "always"
 		}
 
@@ -583,7 +489,7 @@ func dockerComposeToKomposeMapping(composeObject *types.Project) (kobject.Kompos
 		// Again, in v3, we use the "long syntax" for volumes in terms of parsing
 		// https://docs.docker.com/compose/compose-file/#long-syntax-3
 		serviceConfig.VolList = loadVolumes(composeServiceConfig.Volumes)
-		if err := parseKomposeLabels(composeServiceConfig.Labels, &serviceConfig); err != nil {
+		if err := parseKomposeLabelsWithReport(composeServiceConfig.Labels, &serviceConfig, report); err != nil {
 			return kobject.KomposeObject{}, err
 		}
 
@@ -732,6 +638,36 @@ func handleCronJobSchedule(schedule string) (string, error) {
 
 	return schedule, nil
 
+}
+
+// parseKomposeLabelsWithReport validates kompose labels and records any
+// rejection in the shared diagnostic report as invalid user input. The error
+// text is unchanged, so existing callers and scripts keep working.
+func parseKomposeLabelsWithReport(labels map[string]string, serviceConfig *kobject.ServiceConfig, report *diagnostic.Report) error {
+	err := parseKomposeLabels(labels, serviceConfig)
+	if err == nil {
+		return nil
+	}
+	key := "labels"
+	switch {
+	case strings.Contains(err.Error(), LabelServiceType):
+		key = LabelServiceType
+	case strings.Contains(err.Error(), LabelNodePortPort):
+		key = LabelNodePortPort
+	case strings.Contains(err.Error(), LabelServiceExposeTLSSecret):
+		key = LabelServiceExposeTLSSecret
+	case strings.Contains(err.Error(), LabelServiceExposeIngressClassName):
+		key = LabelServiceExposeIngressClassName
+	}
+	report.Add(diagnostic.Diagnostic{
+		Category: diagnostic.Rejected,
+		Origin:   diagnostic.OriginInvalidInput,
+		Service:  serviceConfig.Name,
+		Key:      key,
+		Location: "pkg/loader/compose/compose.go:parseKomposeLabels",
+		Message:  err.Error(),
+	})
+	return err
 }
 
 // parseKomposeLabels parse kompose labels, also do some validation

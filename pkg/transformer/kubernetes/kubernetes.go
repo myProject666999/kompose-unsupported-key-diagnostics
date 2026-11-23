@@ -31,6 +31,7 @@ import (
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/fatih/structs"
+	"github.com/kubernetes/kompose/pkg/diagnostic"
 	"github.com/kubernetes/kompose/pkg/kobject"
 	"github.com/kubernetes/kompose/pkg/loader/compose"
 	"github.com/kubernetes/kompose/pkg/transformer"
@@ -55,6 +56,11 @@ import (
 type Kubernetes struct {
 	// the user provided options from the command line
 	Opt kobject.ConvertOptions
+	// Report is the shared degradation report. Transform sets it from
+	// KomposeObject.Diagnostics so helper methods that do not receive the whole
+	// object can still record diagnostics. It is nil when a Kubernetes value is
+	// constructed by hand, and every Report method is nil-safe.
+	Report *diagnostic.Report
 }
 
 // PVCRequestSize (Persistent Volume Claim) has default size
@@ -72,36 +78,37 @@ const (
 	StatefulStateController = "statefulset"
 )
 
-// CheckUnsupportedKey checks if given komposeObject contains
-// keys that are not supported by this transformer.
-// list of all unsupported keys are stored in unsupportedKey variable
-// returns list of TODO: ....
+// CheckUnsupportedKey reports the degradation diagnostics that only become
+// visible at transformation time. The loader-side registry is the source of
+// truth for Compose service keys; this method exists for deviations owned by
+// the Kubernetes transformer (for example an empty advanced-restart config).
+//
+// Unlike the previous reflection walk it never reports a key twice across
+// services; the shared Report aggregates by (category, key, message).
 func (k *Kubernetes) CheckUnsupportedKey(komposeObject *kobject.KomposeObject, unsupportedKey map[string]bool) []string {
-	// collect all keys found in project
+	// The set of transformer-only degradations is currently empty: keys that
+	// affect conversion are recorded by the compose loader registry. The
+	// signature is kept so OpenShift can call it without duplicating the
+	// report wiring, and so future transformer-specific limits have a home.
+	if len(unsupportedKey) == 0 {
+		return nil
+	}
+	// Preserve the previous contract of returning the tags that matched, but
+	// do not emit individual log lines; the shared Report renders them.
 	var keysFound []string
-
 	for _, serviceConfig := range komposeObject.ServiceConfigs {
-		// this reflection is used in check for empty arrays
 		val := reflect.ValueOf(serviceConfig)
 		s := structs.New(serviceConfig)
-
 		for _, f := range s.Fields() {
-			// Check if given key is among unsupported keys, and skip it if we already saw this key
 			if alreadySaw, ok := unsupportedKey[f.Name()]; ok && !alreadySaw {
-				if f.IsExported() && !f.IsZero() {
-					// IsZero returns false for empty array/slice ([])
-					// this check if field is Slice, and then it checks its size
-					if field := val.FieldByName(f.Name()); field.Kind() == reflect.Slice {
-						if field.Len() == 0 {
-							// array is empty it doesn't matter if it is in unsupportedKey or not
-							continue
-						}
-					}
-					//get tag from kobject service configure
-					tag := f.Tag(komposeObject.LoadedFrom)
-					keysFound = append(keysFound, tag)
-					unsupportedKey[f.Name()] = true
+				if !f.IsExported() || f.IsZero() {
+					continue
 				}
+				if field := val.FieldByName(f.Name()); field.Kind() == reflect.Slice && field.Len() == 0 {
+					continue
+				}
+				keysFound = append(keysFound, f.Tag(komposeObject.LoadedFrom))
+				unsupportedKey[f.Name()] = true
 			}
 		}
 	}
@@ -228,6 +235,15 @@ func (k *Kubernetes) InitConfigMapForEnvWithLookup(name string, opt kobject.Conv
 	}
 	envs, err := LoadEnvFiles(filepath.Join(workDir, envFile), lookup)
 	if err != nil {
+		k.Report.Add(diagnostic.Diagnostic{
+			Category: diagnostic.Rejected,
+			Origin:   diagnostic.OriginUnsupported,
+			Service:  name,
+			Key:      "env_file",
+			Original: envFile,
+			Location: "pkg/transformer/kubernetes/kubernetes.go:InitConfigMapForEnvWithLookup",
+			Message:  "Unable to retrieve env file: " + err.Error(),
+		})
 		log.Fatalf("Unable to retrieve env file: %s", err)
 	}
 
@@ -259,6 +275,15 @@ func (k *Kubernetes) InitConfigMapForEnv(name string, opt kobject.ConvertOptions
 	}
 	envs, err := GetEnvsFromFile(filepath.Join(workDir, envFile))
 	if err != nil {
+		k.Report.Add(diagnostic.Diagnostic{
+			Category: diagnostic.Rejected,
+			Origin:   diagnostic.OriginUnsupported,
+			Service:  name,
+			Key:      "env_file",
+			Original: envFile,
+			Location: "pkg/transformer/kubernetes/kubernetes.go:InitConfigMapForEnv",
+			Message:  "Unable to retrieve env file: " + err.Error(),
+		})
 		log.Fatalf("Unable to retrieve env file: %s", err)
 	}
 
@@ -648,7 +673,12 @@ func (k *Kubernetes) CreateSecrets(komposeObject kobject.KomposeObject) ([]*api.
 			}
 			objects = append(objects, secret)
 		} else {
-			log.Warnf("External secrets %s is not currently supported - ignoring", name)
+			komposeObject.Diagnostics.Add(diagnostic.Diagnostic{
+				Category: diagnostic.Ignored,
+				Key:      "secrets." + name + ".external",
+				Original: "true",
+				Message:  "External secrets " + name + " is not currently supported - ignoring",
+			})
 		}
 	}
 	return objects, nil
@@ -767,6 +797,19 @@ func (k *Kubernetes) ConfigServicePorts(service kobject.ServiceConfig) []api.Ser
 		if _, ok := seenPorts[int(port.HostPort)]; ok {
 			// https://github.com/kubernetes/kubernetes/issues/2995
 			if service.ServiceType == string(api.ServiceTypeLoadBalancer) {
+				// Invalid for Kubernetes: a LoadBalancer service cannot expose
+				// the same port over TCP and UDP. Keep the fatal exit for
+				// compatibility, but record it as a rejected diagnostic so it
+				// appears in the structured report and inventory.
+				k.Report.Add(diagnostic.Diagnostic{
+					Category: diagnostic.Rejected,
+					Origin:   diagnostic.OriginUnsupported,
+					Service:  service.Name,
+					Key:      "ports",
+					Original: name,
+					Location: "pkg/transformer/kubernetes/kubernetes.go:ConfigServicePorts",
+					Message:  fmt.Sprintf("Service %s of type LoadBalancer cannot use TCP and UDP for the same port", name),
+				})
 				log.Fatalf("Service %s of type LoadBalancer cannot use TCP and UDP for the same port", name)
 			}
 			name = fmt.Sprintf("%s-%s", name, strings.ToLower(port.Protocol))
@@ -852,10 +895,22 @@ func (k *Kubernetes) ConfigSecretVolumes(name string, service kobject.ServiceCon
 		for _, secretConfig := range service.Secrets {
 			secretConfig := reformatSecretConfigUnderscoreWithDash(secretConfig)
 			if secretConfig.UID != "" {
-				log.Warnf("Ignore pid in secrets for service: %s", name)
+				k.Report.Add(diagnostic.Diagnostic{
+					Category: diagnostic.Ignored,
+					Service:  name,
+					Key:      "secrets.uid",
+					Original: secretConfig.UID,
+					Message:  "Ignore pid in secrets for service: " + name,
+				})
 			}
 			if secretConfig.GID != "" {
-				log.Warnf("Ignore gid in secrets for service: %s", name)
+				k.Report.Add(diagnostic.Diagnostic{
+					Category: diagnostic.Ignored,
+					Service:  name,
+					Key:      "secrets.gid",
+					Original: secretConfig.GID,
+					Message:  "Ignore gid in secrets for service: " + name,
+				})
 			}
 
 			var secretItemPath, secretMountPath, secretSubPath string
@@ -1017,7 +1072,13 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 		// not used asigned readonly because dont break e2e
 		useConfigMap, _, skip = isConfigFile(mountHost)
 		if skip {
-			log.Warnf("Skip file in path %s ", volume.Host)
+			k.Report.Add(diagnostic.Diagnostic{
+				Category: diagnostic.Ignored,
+				Service:  name,
+				Key:      "volumes",
+				Original: volume.Host,
+				Message:  "Skip file in path " + volume.Host + " ",
+			})
 			continue
 		}
 		if volume.VolumeName == "" {
@@ -1109,7 +1170,13 @@ func (k *Kubernetes) ConfigVolumes(name string, service kobject.ServiceConfig) (
 		volumes = append(volumes, vol)
 
 		if len(volume.Host) > 0 && (!useHostPath && !useConfigMap) {
-			log.Warningf("Volume mount on the host %q isn't supported - ignoring path on the host", volume.Host)
+			k.Report.Add(diagnostic.Diagnostic{
+				Category: diagnostic.Ignored,
+				Service:  name,
+				Key:      "volumes",
+				Original: volume.Host,
+				Message:  fmt.Sprintf("Volume mount on the host %q isn't supported - ignoring path on the host", volume.Host),
+			})
 		}
 	}
 
@@ -1383,7 +1450,13 @@ func (k *Kubernetes) createConfigMapFromComposeConfig(name string, service kobje
 			objects = append(objects, configMap)
 		} else if currentConfigObj.Environment != "" {
 			// TODO: Add support for environment variables in configmaps
-			log.Warnf("Environment variables in configmaps are not supported yet")
+			k.Report.Add(diagnostic.Diagnostic{
+				Category: diagnostic.Ignored,
+				Service:  name,
+				Key:      "configs." + currentConfigName + ".environment",
+				Original: currentConfigObj.Environment,
+				Message:  "Environment variables in configmaps are not supported yet",
+			})
 		} else {
 			log.Warnf("Configmap %s is empty", currentConfigName)
 		}
@@ -1543,6 +1616,10 @@ func (k *Kubernetes) configNetworkPolicyForService(service kobject.ServiceConfig
 // Transform maps komposeObject to k8s objects
 // returns object that are already sorted in the way that Services are first
 func (k *Kubernetes) Transform(komposeObject kobject.KomposeObject, opt kobject.ConvertOptions) ([]runtime.Object, error) {
+	// Share the loader-created report so helper methods can record diagnostics
+	// and app.Convert can render everything once.
+	k.Report = komposeObject.Diagnostics
+
 	// this will hold all the converted data
 	var allobjects []runtime.Object
 

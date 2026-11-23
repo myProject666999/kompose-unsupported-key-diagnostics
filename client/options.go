@@ -23,3 +23,12 @@ func WithErrorOnWarning() Opt {
 		return nil
 	}
 }
+
+// WithStrict makes Convert fail when any Compose key was ignored or
+// approximated. Rejected keys always abort conversion.
+func WithStrict() Opt {
+	return func(k *Kompose) error {
+		k.strict = true
+		return nil
+	}
+}

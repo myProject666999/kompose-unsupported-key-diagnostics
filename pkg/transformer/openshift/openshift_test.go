@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kubernetes/kompose/pkg/diagnostic"
 	"github.com/kubernetes/kompose/pkg/kobject"
 	"github.com/kubernetes/kompose/pkg/testutils"
 	"github.com/kubernetes/kompose/pkg/transformer"
@@ -410,6 +411,38 @@ func TestRestartOnFailure(t *testing.T) {
 		if err == nil {
 			t.Errorf("Expected an error, got %v instead", err)
 		}
+	}
+}
+
+// TestRestartOnFailureRecordsRejectedDiagnostic asserts the OpenShift
+// controller/restart conflict is recorded in the shared diagnostic report as a
+// rejected, unsupported-input diagnostic.
+func TestRestartOnFailureRecordsRejectedDiagnostic(t *testing.T) {
+	komposeObject := kobject.KomposeObject{
+		ServiceConfigs: map[string]kobject.ServiceConfig{"app": {Name: "app", Restart: "on-failure"}},
+		Diagnostics:    diagnostic.NewReport(),
+	}
+	o := OpenShift{}
+	if _, err := o.Transform(komposeObject, kobject.ConvertOptions{IsDeploymentConfigFlag: true, Replicas: 1}); err == nil {
+		t.Fatal("expected an error")
+	}
+
+	items := komposeObject.Diagnostics.Items()
+	if len(items) != 1 {
+		t.Fatalf("expected one diagnostic, got %v", items)
+	}
+	item := items[0]
+	if item.Category != diagnostic.Rejected {
+		t.Errorf("expected Rejected category, got %q", item.Category)
+	}
+	if item.Origin != diagnostic.OriginUnsupported {
+		t.Errorf("expected unsupported origin, got %q", item.Origin)
+	}
+	if item.Location == "" {
+		t.Error("rejected diagnostics must carry a location")
+	}
+	if !strings.Contains(item.Message, "Controller object cannot be specified") {
+		t.Errorf("message must keep the legacy phrase, got %q", item.Message)
 	}
 }
 

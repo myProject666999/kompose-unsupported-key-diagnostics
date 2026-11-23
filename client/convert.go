@@ -50,6 +50,7 @@ func (k *Kompose) Convert(options ConvertOptions) ([]runtime.Object, error) {
 		ServiceGroupName:            k.serviceGroupName(options),
 		SecretsAsFiles:              k.secretsAsFiles(options),
 		GenerateNetworkPolicies:     options.GenerateNetworkPolicies,
+		Strict:                      k.strict,
 	}
 	err = app.ValidateComposeFile(&kobjectConvertOptions)
 	if err != nil {

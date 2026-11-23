@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/kubernetes/kompose/pkg/diagnostic"
 	deployapi "github.com/openshift/api/apps/v1"
 	"github.com/pkg/errors"
 	"github.com/spf13/cast"
@@ -42,6 +43,11 @@ type KomposeObject struct {
 
 	// Namespace is the namespace where all the generated objects would be assigned to
 	Namespace string
+
+	// Diagnostics is the shared degradation report. The loader creates it, the
+	// transformers append to it and the application renders it once. It is nil
+	// for hand-constructed objects and every Report method is nil-safe.
+	Diagnostics *diagnostic.Report
 }
 
 // ConvertOptions holds all options that controls transformation process
@@ -93,6 +99,11 @@ type ConvertOptions struct {
 	SecretsAsFiles          bool
 	GenerateNetworkPolicies bool
 	NoInterpolate           bool
+
+	// Strict makes app.Convert return a non-zero exit error when any ignored
+	// or approximated degradation diagnostic was produced. It never suppresses
+	// rejected diagnostics, which already abort conversion.
+	Strict bool
 }
 
 // IsPodController indicate if the user want to use a controller

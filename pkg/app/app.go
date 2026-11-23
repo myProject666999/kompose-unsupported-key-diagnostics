@@ -253,8 +253,14 @@ func Convert(opt kobject.ConvertOptions) ([]runtime.Object, error) {
 	// Get a transformer that maps komposeObject to provider's primitives
 	t := getTransformer(opt)
 
-	// Do the transformation
+	// Do the transformation. The transformer appends to the same report the
+	// loader created, because KomposeObject.Diagnostics is a pointer.
 	objects, err := t.Transform(komposeObject, opt)
+
+	// Emit the degradation diagnostics exactly once, after both the loader and
+	// the transformer have contributed. Rejected diagnostics are logged at
+	// error level, so --suppress-warnings cannot hide them.
+	komposeObject.Diagnostics.Emit()
 
 	if err != nil {
 		log.Fatal(err)
@@ -264,6 +270,14 @@ func Convert(opt kobject.ConvertOptions) ([]runtime.Object, error) {
 	err = kubernetes.PrintList(objects, opt)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// Strict mode turns ignored and approximated diagnostics into a non-zero
+	// exit. Rejected keys already abort above.
+	if opt.Strict {
+		if violations := komposeObject.Diagnostics.StrictViolations(); len(violations) > 0 {
+			return objects, fmt.Errorf("strict mode: %d ignored or approximated Compose key(s) were detected", len(violations))
+		}
 	}
 	return objects, err
 }

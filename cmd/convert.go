@@ -77,6 +77,10 @@ var (
 	// be the default for kompose, but we must keep compatibility with the previous behavior.
 	// See https://github.com/kubernetes/kompose/issues/1280 for more details.
 	SecretsAsFiles bool
+
+	// Strict makes convert exit non-zero when any ignored or approximated
+	// Compose key is detected. Rejected keys always abort conversion.
+	Strict bool
 )
 
 var convertCmd = &cobra.Command{
@@ -133,6 +137,7 @@ var convertCmd = &cobra.Command{
 			BuildCommand:                BuildCommand,
 			PushCommand:                 PushCommand,
 			Namespace:                   ConvertNamespace,
+			Strict:                      Strict,
 		}
 
 		if ServiceGroupMode == "" && MultipleContainerMode {
@@ -148,8 +153,11 @@ var convertCmd = &cobra.Command{
 		}
 	},
 	Run: func(cmd *cobra.Command, args []string) {
-
-		app.Convert(ConvertOpt)
+		if _, err := app.Convert(ConvertOpt); err != nil {
+			// app.Convert already logs fatal errors for real conversion
+			// failures; an error returned here is the strict-mode summary.
+			log.Fatal(err)
+		}
 	},
 }
 
@@ -175,6 +183,9 @@ func init() {
 	convertCmd.Flags().StringVar(&ServiceGroupName, "service-group-name", "", "Using with --service-group-mode=volume to specific a final service name for the group")
 	convertCmd.Flags().MarkDeprecated("multiple-container-mode", "use --service-group-mode=label")
 	convertCmd.Flags().BoolVar(&SecretsAsFiles, "secrets-as-files", false, "Always convert docker-compose secrets into files instead of symlinked directories")
+
+	// Strict mode: fail when any ignored or approximated Compose key is detected.
+	convertCmd.Flags().BoolVar(&Strict, "strict", false, "Exit with a non-zero code when any Compose key is ignored or approximated during conversion")
 
 	// OpenShift only
 	convertCmd.Flags().BoolVar(&ConvertDeploymentConfig, "deployment-config", true, "Generate an OpenShift deploymentconfig object")

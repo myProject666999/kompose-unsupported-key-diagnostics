@@ -4,6 +4,7 @@ type Kompose struct {
 	suppressWarnings bool
 	verbose          bool
 	errorOnWarning   bool
+	strict           bool
 }
 
 func NewClient(opts ...Opt) (*Kompose, error) {
@@ -11,6 +12,7 @@ func NewClient(opts ...Opt) (*Kompose, error) {
 		suppressWarnings: false,
 		verbose:          false,
 		errorOnWarning:   false,
+		strict:           false,
 	}
 	for _, op := range opts {
 		if err := op(k); err != nil {

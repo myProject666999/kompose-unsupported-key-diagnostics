@@ -59,3 +59,9 @@ func TestNewClientWithOpts(t *testing.T) {
 		assert.Check(t, is.Equal(client.suppressWarnings, tc.expectedSuppressWarnings))
 	}
 }
+
+func TestNewClientWithStrict(t *testing.T) {
+	client, err := NewClient(WithStrict())
+	assert.Check(t, is.Equal(err, nil))
+	assert.Check(t, client.strict)
+}
